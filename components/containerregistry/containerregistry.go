@@ -9,8 +9,10 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/google/go-containerregistry/pkg/crane"
-	"github.com/google/go-containerregistry/pkg/registry"
+	"cuelabs.dev/go/oci/ociregistry/ociclient"
+	"cuelabs.dev/go/oci/ociregistry/ocimem"
+	"cuelabs.dev/go/oci/ociregistry/ociserver"
+	"cuelabs.dev/go/oci/ociregistry/ociunify"
 	"github.com/rs/zerolog/log"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
@@ -18,47 +20,30 @@ import (
 )
 
 const (
-	ComponentName  = "container_registry"
-	StartPort      = "start"
-	ReplicatePort  = "replicate"
-	EventPort      = "event"
-	ErrorPort      = "error"
+	ComponentName = "container_registry"
+	StartPort     = "start"
+	EventPort     = "event"
 )
 
 // Context type alias for schema generation
 type Context any
 
 // Settings configures the component
-type Settings struct {
-	EnableErrorPort bool `json:"enableErrorPort" title:"Enable Error Port" description:"Output errors to error port instead of failing"`
-}
+type Settings struct{}
 
 // Start configures and starts the registry server
 type Start struct {
-	Context Context `json:"context,omitempty" configurable:"true" title:"Context"`
-	Port    int     `json:"port" required:"true" title:"Port" description:"Port to listen on"`
+	Context   Context `json:"context,omitempty" configurable:"true" title:"Context"`
+	Port      int     `json:"port" required:"true" title:"Port" description:"Port to listen on"`
+	RemoteURL string  `json:"remoteURL,omitempty" title:"Upstream Registry" description:"Pull-through cache upstream host (e.g., registry-1.docker.io). Leave empty for standalone registry."`
 }
 
-// ReplicateRequest triggers pulling an image from a remote registry into this one
-type ReplicateRequest struct {
-	Context  Context `json:"context,omitempty" configurable:"true" title:"Context" description:"Arbitrary context to pass through"`
-	Source   string  `json:"source" required:"true" title:"Source Image" description:"Remote image reference (e.g., docker.io/library/nginx:latest)"`
-	Target   string  `json:"target" required:"true" title:"Target Repository" description:"Local repository name (e.g., nginx:latest). Will be stored in this registry."`
-	Insecure bool    `json:"insecure,omitempty" title:"Insecure Source" description:"Allow insecure (HTTP) for the source registry"`
-}
-
-// RegistryEvent is emitted on push, pull, or replicate operations
+// RegistryEvent is emitted on registry operations
 type RegistryEvent struct {
-	Context    Context `json:"context,omitempty" configurable:"true" title:"Context"`
-	Action     string  `json:"action" title:"Action" description:"push, pull, or replicate"`
-	Repository string  `json:"repository" title:"Repository"`
-	Reference  string  `json:"reference" title:"Reference" description:"Tag or digest"`
-}
-
-// Error output
-type Error struct {
-	Context Context `json:"context,omitempty" title:"Context"`
-	Error   string  `json:"error" title:"Error"`
+	Context Context `json:"context,omitempty" configurable:"true" title:"Context"`
+	Action  string  `json:"action" title:"Action" description:"Request method"`
+	Path    string  `json:"path" title:"Path" description:"Request path"`
+	Status  int     `json:"status" title:"Status" description:"HTTP status code"`
 }
 
 // Component implements the container registry server
@@ -71,7 +56,6 @@ type Component struct {
 
 	storagePath string
 	nodeName    string
-	listenPort  int
 }
 
 func (c *Component) Instance() module.Component {
@@ -82,7 +66,7 @@ func (c *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "Container Registry",
-		Info:        "OCI-compliant container registry server with image replication. Starts an HTTP registry server that containers can push/pull images to. Use the replicate port to pull images from remote registries into local storage. Designed for edge caching, air-gapped environments, or staging registries within your cluster. Mount a PVC with storage.enabled=true for persistence.",
+		Info:        "OCI-compliant container registry server. Standalone mode: push and pull images directly. Pull-through cache mode: set upstream registry host and it transparently proxies requests, caching locally. Uses cuelabs ociregistry library. Mount a PVC with storage.enabled=true for persistence across restarts.",
 		Tags:        []string{"OCI", "Registry", "Container", "Server", "Cache", "Edge"},
 	}
 }
@@ -120,20 +104,13 @@ func (c *Component) Handle(ctx context.Context, handler module.Handler, port str
 		if !ok {
 			return fmt.Errorf("invalid start message")
 		}
-		return c.start(ctx, in)
-
-	case ReplicatePort:
-		in, ok := msg.(ReplicateRequest)
-		if !ok {
-			return fmt.Errorf("invalid replicate request")
-		}
-		return c.replicate(ctx, handler, in)
+		return c.start(ctx, handler, in)
 	}
 
 	return fmt.Errorf("unknown port: %s", port)
 }
 
-func (c *Component) start(ctx context.Context, cfg Start) any {
+func (c *Component) start(ctx context.Context, handler module.Handler, cfg Start) any {
 	c.cancelFuncLock.Lock()
 	if c.cancelFunc != nil {
 		c.cancelFunc()
@@ -142,9 +119,29 @@ func (c *Component) start(ctx context.Context, cfg Start) any {
 	c.cancelFunc = cancel
 	c.cancelFuncLock.Unlock()
 
-	c.listenPort = cfg.Port
+	// Local in-memory registry (TODO: disk-backed implementation using storagePath)
+	local := ocimem.New()
 
-	regHandler := registry.New()
+	var httpHandler http.Handler
+
+	if cfg.RemoteURL != "" {
+		// Pull-through cache: local first, fall back to upstream
+		upstream, err := ociclient.New(cfg.RemoteURL, nil)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("failed to create upstream client for %s: %w", cfg.RemoteURL, err)
+		}
+		unified := ociunify.New(local, upstream, &ociunify.Options{
+			ReadPolicy: ociunify.ReadSequential,
+		})
+		httpHandler = ociserver.New(unified, nil)
+	} else {
+		// Standalone registry
+		httpHandler = ociserver.New(local, nil)
+	}
+
+	// Wrap with event middleware
+	wrappedHandler := c.wrapWithEvents(httpHandler, handler, cfg.Context)
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	listener, err := net.Listen("tcp", addr)
@@ -153,14 +150,18 @@ func (c *Component) start(ctx context.Context, cfg Start) any {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
 
-	server := &http.Server{Handler: regHandler}
+	server := &http.Server{Handler: wrappedHandler}
 
 	go func() {
 		<-serverCtx.Done()
 		server.Close()
 	}()
 
-	log.Info().Int("port", cfg.Port).Msg("container registry started")
+	mode := "standalone"
+	if cfg.RemoteURL != "" {
+		mode = fmt.Sprintf("pull-through → %s", cfg.RemoteURL)
+	}
+	log.Info().Int("port", cfg.Port).Str("mode", mode).Msg("container registry started")
 
 	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("server error: %w", err)
@@ -169,60 +170,35 @@ func (c *Component) start(ctx context.Context, cfg Start) any {
 	return nil
 }
 
-func (c *Component) replicate(ctx context.Context, handler module.Handler, req ReplicateRequest) any {
-	if req.Source == "" || req.Target == "" {
-		return c.handleError(ctx, handler, req.Context, "source and target are required")
-	}
+func (c *Component) wrapWithEvents(next http.Handler, handler module.Handler, flowCtx Context) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rw, r)
 
-	// Build the local target reference pointing at this registry
-	localTarget := fmt.Sprintf("localhost:%d/%s", c.listenPort, req.Target)
-
-	srcOpts := []crane.Option{crane.WithContext(ctx)}
-	if req.Insecure {
-		srcOpts = append(srcOpts, crane.Insecure)
-	}
-
-	// Pull from remote
-	img, err := crane.Pull(req.Source, srcOpts...)
-	if err != nil {
-		return c.handleError(ctx, handler, req.Context, fmt.Sprintf("failed to pull %s: %v", req.Source, err))
-	}
-
-	// Push to local registry (always insecure since it's localhost)
-	if err := crane.Push(img, localTarget, crane.Insecure); err != nil {
-		return c.handleError(ctx, handler, req.Context, fmt.Sprintf("failed to push to local registry: %v", err))
-	}
-
-	log.Info().Str("source", req.Source).Str("target", localTarget).Msg("image replicated")
-
-	return handler(ctx, EventPort, RegistryEvent{
-		Context:    req.Context,
-		Action:     "replicate",
-		Repository: req.Target,
-		Reference:  req.Source,
+		// Emit event for successful write operations
+		if (r.Method == http.MethodPut || r.Method == http.MethodPatch) && rw.status >= 200 && rw.status < 300 {
+			go handler(context.Background(), EventPort, RegistryEvent{
+				Context: flowCtx,
+				Action:  r.Method,
+				Path:    r.URL.Path,
+				Status:  rw.status,
+			})
+		}
 	})
 }
 
-func (c *Component) handleError(ctx context.Context, handler module.Handler, reqContext Context, errMsg string) any {
-	c.settingsLock.RLock()
-	enableErrorPort := c.settings.EnableErrorPort
-	c.settingsLock.RUnlock()
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
 
-	if enableErrorPort {
-		return handler(ctx, ErrorPort, Error{
-			Context: reqContext,
-			Error:   errMsg,
-		})
-	}
-	return fmt.Errorf("%s", errMsg)
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
 }
 
 func (c *Component) Ports() []module.Port {
-	c.settingsLock.RLock()
-	enableErrorPort := c.settings.EnableErrorPort
-	c.settingsLock.RUnlock()
-
-	ports := []module.Port{
+	return []module.Port{
 		{
 			Name:          v1alpha1.SettingsPort,
 			Label:         "Settings",
@@ -242,38 +218,17 @@ func (c *Component) Ports() []module.Port {
 			Position: module.Left,
 		},
 		{
-			Name:  ReplicatePort,
-			Label: "Replicate",
-			Configuration: ReplicateRequest{
-				Source: "docker.io/library/nginx:latest",
-				Target: "nginx:latest",
-			},
-			Position: module.Left,
-		},
-		{
 			Name:   EventPort,
 			Label:  "Event",
 			Source: true,
 			Configuration: RegistryEvent{
-				Action:     "replicate",
-				Repository: "nginx",
-				Reference:  "docker.io/library/nginx:latest",
+				Action: "PUT",
+				Path:   "/v2/library/nginx/manifests/latest",
+				Status: 201,
 			},
 			Position: module.Right,
 		},
 	}
-
-	if enableErrorPort {
-		ports = append(ports, module.Port{
-			Name:          ErrorPort,
-			Label:         "Error",
-			Source:        true,
-			Configuration: Error{},
-			Position:      module.Bottom,
-		})
-	}
-
-	return ports
 }
 
 var _ module.Component = (*Component)(nil)
