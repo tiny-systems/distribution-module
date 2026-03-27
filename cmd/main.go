@@ -3,27 +3,30 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/rs/zerolog"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
-	_ "github.com/tiny-systems/example-module/components/echo"
-	"github.com/tiny-systems/module/cli"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/rs/zerolog"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"github.com/tiny-systems/module/cli"
+
+	// Import components to register them
+	_ "github.com/tiny-systems/distribution-module/components/registrycatalog"
+	_ "github.com/tiny-systems/distribution-module/components/registrycopy"
 )
 
 // RootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "server",
-	Short: "tiny-system's example module",
+	Short: "tiny-system's distribution module",
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
 	},
 }
 
 func main() {
-	// Default level for this example is info, unless debug flag is present
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	viper.AutomaticEnv()
 	if viper.GetBool("debug") {
