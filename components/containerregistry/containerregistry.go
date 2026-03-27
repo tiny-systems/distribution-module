@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"cuelabs.dev/go/oci/ociregistry/ociclient"
-	"cuelabs.dev/go/oci/ociregistry/ocimem"
 	"cuelabs.dev/go/oci/ociregistry/ociserver"
 	"cuelabs.dev/go/oci/ociregistry/ociunify"
 	"github.com/rs/zerolog/log"
@@ -119,8 +118,17 @@ func (c *Component) start(ctx context.Context, handler module.Handler, cfg Start
 	c.cancelFunc = cancel
 	c.cancelFuncLock.Unlock()
 
-	// Local in-memory registry (TODO: disk-backed implementation using storagePath)
-	local := ocimem.New()
+	storagePath := c.storagePath
+	if storagePath == "" {
+		storagePath = filepath.Join(os.TempDir(), "registry")
+		if err := os.MkdirAll(storagePath, 0o755); err != nil {
+			cancel()
+			return fmt.Errorf("failed to create storage directory: %w", err)
+		}
+	}
+
+	// Filesystem-backed local registry
+	local := NewDiskRegistry(storagePath)
 
 	var httpHandler http.Handler
 
