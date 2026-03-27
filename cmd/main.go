@@ -13,6 +13,7 @@ import (
 	"github.com/tiny-systems/module/cli"
 
 	// Import components to register them
+	_ "github.com/tiny-systems/distribution-module/components/containerregistry"
 	_ "github.com/tiny-systems/distribution-module/components/registrycatalog"
 	_ "github.com/tiny-systems/distribution-module/components/registrycopy"
 )
