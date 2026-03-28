@@ -11,6 +11,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/tiny-systems/module/cli"
+	"github.com/tiny-systems/module/module"
+	"github.com/tiny-systems/module/registry"
 
 	// Import components to register them
 	_ "github.com/tiny-systems/distribution-module/components/registrycatalog"
@@ -32,6 +34,19 @@ func main() {
 	if viper.GetBool("debug") {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
+
+	// Declare RBAC requirements - registry_copy needs to read docker-registry secrets
+	registry.SetRequirements(module.Requirements{
+		RBAC: module.RBACRequirements{
+			ExtraRules: []module.RBACRule{
+				{
+					APIGroups: []string{""},
+					Resources: []string{"secrets"},
+					Verbs:     []string{"get"},
+				},
+			},
+		},
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
