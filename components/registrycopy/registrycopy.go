@@ -15,6 +15,8 @@ import (
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
 	"github.com/tiny-systems/module/registry"
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -30,20 +32,13 @@ type Settings struct {
 	EnableErrorPort bool `json:"enableErrorPort" title:"Enable Error Port" description:"Output errors to error port instead of failing"`
 }
 
-// RegistryAuth holds credentials for a single registry
-type RegistryAuth struct {
-	Username string `json:"username,omitempty" title:"Username"`
-	Password string `json:"password,omitempty" title:"Password" description:"Password or token"`
-}
-
 type Request struct {
-	Context        Context       `json:"context,omitempty" configurable:"true" title:"Context" description:"Arbitrary context to pass through"`
-	Source         string        `json:"source" required:"true" title:"Source" description:"Source image reference (e.g. docker.io/library/nginx:latest)"`
-	Target         string        `json:"target" required:"true" title:"Target" description:"Target image reference (e.g. localhost:5000/nginx:latest)"`
-	Insecure       bool          `json:"insecure,omitempty" title:"Insecure" description:"Allow insecure (HTTP) connections for target registry"`
-	SourceAuth     *RegistryAuth `json:"sourceAuth,omitempty" title:"Source Auth" description:"Credentials for source registry"`
-	TargetAuth     *RegistryAuth `json:"targetAuth,omitempty" title:"Target Auth" description:"Credentials for target registry"`
-	DockerConfigJSON string      `json:"dockerConfigJSON,omitempty" title:"Docker Config JSON" description:"Raw .dockerconfigjson content (from regcred secret). Auto-matches credentials by registry hostname."`
+	Context         Context `json:"context,omitempty" configurable:"true" title:"Context" description:"Arbitrary context to pass through"`
+	Source          string  `json:"source" required:"true" title:"Source" description:"Source image reference (e.g. docker.io/library/nginx:latest)"`
+	Target          string  `json:"target" required:"true" title:"Target" description:"Target image reference (e.g. localhost:5000/nginx:latest)"`
+	Insecure        bool    `json:"insecure,omitempty" title:"Insecure" description:"Allow insecure (HTTP) connections for target registry"`
+	SecretName      string  `json:"secretName,omitempty" title:"Secret Name" description:"K8s docker-registry secret name (e.g. regcred). Read automatically from the cluster."`
+	SecretNamespace string  `json:"secretNamespace,omitempty" title:"Secret Namespace" description:"Namespace of the secret. Defaults to source deployment namespace from context."`
 }
 
 type CopyResult struct {
@@ -65,6 +60,9 @@ type Error struct {
 type Component struct {
 	settings     Settings
 	settingsLock sync.RWMutex
+
+	k8sClient     client.Client
+	k8sClientLock sync.RWMutex
 }
 
 func (c *Component) Instance() module.Component {
@@ -75,13 +73,21 @@ func (c *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "Registry Copy",
-		Info:        "Copy a container image from one registry to another. Supports auth via explicit credentials or dockerconfigjson (regcred secret). Set insecure=true when target has no TLS.",
+		Info:        "Copy a container image from one registry to another. Supports auth via K8s docker-registry secrets (regcred). Set secretName to auto-read credentials from the cluster. Set insecure=true when target has no TLS.",
 		Tags:        []string{"OCI", "Registry", "Container", "Copy", "Replicate"},
 	}
 }
 
 func (c *Component) Handle(ctx context.Context, handler module.Handler, port string, msg any) any {
 	switch port {
+	case v1alpha1.ClientPort:
+		if k8sProvider, ok := msg.(module.K8sClient); ok {
+			c.k8sClientLock.Lock()
+			c.k8sClient = k8sProvider.GetK8sClient()
+			c.k8sClientLock.Unlock()
+		}
+		return nil
+
 	case v1alpha1.SettingsPort:
 		in, ok := msg.(Settings)
 		if !ok {
@@ -108,7 +114,10 @@ func (c *Component) handleRequest(ctx context.Context, handler module.Handler, r
 		return c.handleError(ctx, handler, req, "source and target are required")
 	}
 
-	keychain := c.buildKeychain(req)
+	keychain, err := c.buildKeychain(ctx, req)
+	if err != nil {
+		return c.handleError(ctx, handler, req, fmt.Sprintf("auth setup failed: %v", err))
+	}
 
 	srcOpts := []crane.Option{crane.WithContext(ctx), crane.WithAuthFromKeychain(keychain)}
 	dstOpts := []crane.Option{crane.WithContext(ctx), crane.WithAuthFromKeychain(keychain)}
@@ -116,13 +125,11 @@ func (c *Component) handleRequest(ctx context.Context, handler module.Handler, r
 		dstOpts = append(dstOpts, crane.Insecure)
 	}
 
-	// Pull from source
 	img, err := crane.Pull(req.Source, srcOpts...)
 	if err != nil {
 		return c.handleError(ctx, handler, req, fmt.Sprintf("pull failed: %v", err))
 	}
 
-	// Push to target
 	if err := crane.Push(img, req.Target, dstOpts...); err != nil {
 		return c.handleError(ctx, handler, req, fmt.Sprintf("push failed: %v", err))
 	}
@@ -142,28 +149,37 @@ func (c *Component) handleRequest(ctx context.Context, handler module.Handler, r
 	})
 }
 
-// buildKeychain constructs an authn.Keychain from the request's auth fields.
-func (c *Component) buildKeychain(req Request) authn.Keychain {
-	kc := &multiKeychain{}
-
-	// Explicit source/target auth takes priority
-	if req.SourceAuth != nil && req.SourceAuth.Username != "" {
-		if reg := registryFromRef(req.Source); reg != "" {
-			kc.add(reg, req.SourceAuth.Username, req.SourceAuth.Password)
-		}
-	}
-	if req.TargetAuth != nil && req.TargetAuth.Username != "" {
-		if reg := registryFromRef(req.Target); reg != "" {
-			kc.add(reg, req.TargetAuth.Username, req.TargetAuth.Password)
-		}
+func (c *Component) buildKeychain(ctx context.Context, req Request) (authn.Keychain, error) {
+	if req.SecretName == "" {
+		return authn.DefaultKeychain, nil
 	}
 
-	// Parse dockerconfigjson if provided
-	if req.DockerConfigJSON != "" {
-		kc.addDockerConfig(req.DockerConfigJSON)
+	c.k8sClientLock.RLock()
+	k8sClient := c.k8sClient
+	c.k8sClientLock.RUnlock()
+
+	if k8sClient == nil {
+		return nil, fmt.Errorf("K8s client not available, cannot read secret %q", req.SecretName)
 	}
 
-	return kc
+	ns := req.SecretNamespace
+	if ns == "" {
+		ns = "default"
+	}
+
+	secret := &corev1.Secret{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: req.SecretName}, secret); err != nil {
+		return nil, fmt.Errorf("failed to read secret %s/%s: %v", ns, req.SecretName, err)
+	}
+
+	dockerCfg, ok := secret.Data[".dockerconfigjson"]
+	if !ok {
+		return nil, fmt.Errorf("secret %s/%s has no .dockerconfigjson key", ns, req.SecretName)
+	}
+
+	kc := &configKeychain{}
+	kc.parse(string(dockerCfg))
+	return kc, nil
 }
 
 func (c *Component) handleError(ctx context.Context, handler module.Handler, req Request, errMsg string) any {
@@ -187,6 +203,11 @@ func (c *Component) Ports() []module.Port {
 
 	ports := []module.Port{
 		{
+			Name:     v1alpha1.ClientPort,
+			Label:    "Client",
+			Position: module.Left,
+		},
+		{
 			Name:          v1alpha1.SettingsPort,
 			Label:         "Settings",
 			Configuration: Settings{},
@@ -195,8 +216,9 @@ func (c *Component) Ports() []module.Port {
 			Name:  RequestPort,
 			Label: "Request",
 			Configuration: Request{
-				Source: "docker.io/library/nginx:latest",
-				Target: "localhost:5000/nginx:latest",
+				Source:     "docker.io/library/nginx:latest",
+				Target:     "localhost:5000/nginx:latest",
+				SecretName: "regcred",
 			},
 			Position: module.Left,
 		},
@@ -230,21 +252,12 @@ func (c *Component) Ports() []module.Port {
 
 // --- keychain implementation ---
 
-type multiKeychain struct {
+type configKeychain struct {
 	creds map[string]authn.AuthConfig
 }
 
-func (k *multiKeychain) add(registry, username, password string) {
-	if k.creds == nil {
-		k.creds = make(map[string]authn.AuthConfig)
-	}
-	k.creds[registry] = authn.AuthConfig{Username: username, Password: password}
-}
-
-func (k *multiKeychain) addDockerConfig(raw string) {
-	if k.creds == nil {
-		k.creds = make(map[string]authn.AuthConfig)
-	}
+func (k *configKeychain) parse(raw string) {
+	k.creds = make(map[string]authn.AuthConfig)
 
 	var cfg struct {
 		Auths map[string]struct {
@@ -267,22 +280,18 @@ func (k *multiKeychain) addDockerConfig(raw string) {
 				}
 			}
 		}
-		// Normalize: strip https:// prefix if present
 		reg = strings.TrimPrefix(reg, "https://")
 		reg = strings.TrimPrefix(reg, "http://")
 		reg = strings.TrimSuffix(reg, "/")
-		if _, exists := k.creds[reg]; !exists {
-			k.creds[reg] = ac
-		}
+		k.creds[reg] = ac
 	}
 }
 
-func (k *multiKeychain) Resolve(res authn.Resource) (authn.Authenticator, error) {
+func (k *configKeychain) Resolve(res authn.Resource) (authn.Authenticator, error) {
 	if k.creds == nil {
 		return authn.Anonymous, nil
 	}
-	registry := res.RegistryStr()
-	if ac, ok := k.creds[registry]; ok {
+	if ac, ok := k.creds[res.RegistryStr()]; ok {
 		return authn.FromConfig(ac), nil
 	}
 	return authn.Anonymous, nil
