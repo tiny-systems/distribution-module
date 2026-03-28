@@ -13,7 +13,8 @@ import (
 	"github.com/tiny-systems/module/cli"
 
 	// Import components to register them
-	_ "github.com/tiny-systems/distribution-module/components/containerregistry"
+	_ "github.com/tiny-systems/distribution-module/components/registrycatalog"
+	_ "github.com/tiny-systems/distribution-module/components/registrycopy"
 )
 
 // RootCmd represents the base command when called without any subcommands

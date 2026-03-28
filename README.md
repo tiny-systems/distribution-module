@@ -6,22 +6,19 @@ Container image distribution for edge and air-gapped Kubernetes environments.
 
 | Component | Description |
 |-----------|-------------|
-| Container Registry | OCI-compliant registry server with standalone and pull-through cache modes |
+| Registry Catalog | List repositories and tags from any OCI-compliant registry |
+| Registry Copy | Copy container images between registries |
 
 ## How it works
 
-**Standalone mode** — a local registry that accepts push and pull. Configure a port, start it, push images.
-
-**Pull-through cache mode** — set an upstream registry host (e.g., `registry-1.docker.io`). When a pod pulls an image, the registry fetches it from upstream and caches it locally. Subsequent pulls are served from cache. No deployment changes needed — just configure containerd to mirror through this registry.
+Use these components with a 3rd-party OCI registry (Zot, Harbor, distribution/registry, etc.) installed via its own Helm chart. This module handles image discovery and replication — the registry is external infrastructure.
 
 ## Installation
 
 ```shell
 helm repo add tinysystems https://tiny-systems.github.io/module/
 helm install distribution-module tinysystems/tinysystems-operator \
-  --set controllerManager.manager.image.repository=ghcr.io/tiny-systems/distribution-module \
-  --set storage.enabled=true \
-  --set storage.size=10Gi
+  --set controllerManager.manager.image.repository=ghcr.io/tiny-systems/distribution-module
 ```
 
 ## Run locally
