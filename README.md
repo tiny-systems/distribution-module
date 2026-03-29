@@ -7,7 +7,7 @@ Container image distribution for edge and air-gapped Kubernetes environments.
 | Component | Description |
 |-----------|-------------|
 | Registry Catalog | List repositories and tags from any OCI-compliant registry |
-| Registry Copy | Copy container images between registries |
+| Registry Copy | Copy container images between registries. Supports dockerConfigJSON for source auth and basic auth for target. |
 
 ## How it works
 

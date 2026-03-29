@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
 	"github.com/tiny-systems/module/registry"
@@ -34,7 +35,9 @@ type Request struct {
 	Source           string  `json:"source" required:"true" title:"Source" description:"Source image reference (e.g. docker.io/library/nginx:latest)"`
 	Target           string  `json:"target" required:"true" title:"Target" description:"Target image reference (e.g. localhost:5000/nginx:latest)"`
 	Insecure         bool    `json:"insecure,omitempty" title:"Insecure" description:"Allow insecure (HTTP) connections for target registry"`
-	DockerConfigJSON string  `json:"dockerConfigJSON,omitempty" configurable:"true" title:"Docker Config JSON" description:"Raw .dockerconfigjson content for registry auth. Read from a K8s secret via kubernetes-module and pass through edges."`
+	DockerConfigJSON string  `json:"dockerConfigJSON,omitempty" title:"Docker Config JSON" description:"Raw .dockerconfigjson content for source registry auth."`
+	TargetUsername   string  `json:"targetUsername,omitempty" title:"Target Username" description:"Basic auth username for target registry"`
+	TargetPassword   string  `json:"targetPassword,omitempty" title:"Target Password" description:"Basic auth password for target registry"`
 }
 
 type CopyResult struct {
@@ -99,10 +102,11 @@ func (c *Component) handleRequest(ctx context.Context, handler module.Handler, r
 		return c.handleError(ctx, handler, req, "source and target are required")
 	}
 
-	keychain := buildKeychain(req.DockerConfigJSON)
+	srcKeychain := buildKeychain(req.DockerConfigJSON)
+	dstKeychain := buildTargetKeychain(req.Target, req.TargetUsername, req.TargetPassword)
 
-	srcOpts := []crane.Option{crane.WithContext(ctx), crane.WithAuthFromKeychain(keychain)}
-	dstOpts := []crane.Option{crane.WithContext(ctx), crane.WithAuthFromKeychain(keychain)}
+	srcOpts := []crane.Option{crane.WithContext(ctx), crane.WithAuthFromKeychain(srcKeychain)}
+	dstOpts := []crane.Option{crane.WithContext(ctx), crane.WithAuthFromKeychain(dstKeychain)}
 	if req.Insecure {
 		dstOpts = append(dstOpts, crane.Insecure)
 	}
@@ -129,6 +133,19 @@ func (c *Component) handleRequest(ctx context.Context, handler module.Handler, r
 			Digest: digest,
 		},
 	})
+}
+
+func buildTargetKeychain(targetRef, username, password string) authn.Keychain {
+	if username == "" {
+		return authn.DefaultKeychain
+	}
+	kc := &configKeychain{creds: make(map[string]authn.AuthConfig)}
+	ref, err := name.ParseReference(targetRef)
+	if err != nil {
+		return authn.DefaultKeychain
+	}
+	kc.creds[ref.Context().RegistryStr()] = authn.AuthConfig{Username: username, Password: password}
+	return kc
 }
 
 func buildKeychain(dockerConfigJSON string) authn.Keychain {
