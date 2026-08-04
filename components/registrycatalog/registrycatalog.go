@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/tiny-systems/distribution-module/internal/regerr"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
 	"github.com/tiny-systems/module/registry"
@@ -94,7 +95,7 @@ func (c *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 func (c *Component) handleRequest(ctx context.Context, handler module.Handler, req Request) module.Result {
 	if req.Registry == "" {
-		return c.handleError(ctx, handler, req, "registry is required")
+		return c.handleError(ctx, handler, req, errors.New("registry is required"))
 	}
 
 	opts := []crane.Option{crane.WithContext(ctx)}
@@ -104,7 +105,7 @@ func (c *Component) handleRequest(ctx context.Context, handler module.Handler, r
 
 	repos, err := crane.Catalog(req.Registry, opts...)
 	if err != nil {
-		return c.handleError(ctx, handler, req, fmt.Sprintf("catalog failed: %v", err))
+		return c.handleError(ctx, handler, req, regerr.Classify(fmt.Errorf("catalog failed: %w", err)))
 	}
 
 	repositories := make([]RepoInfo, 0, len(repos))
@@ -128,7 +129,7 @@ func (c *Component) handleRequest(ctx context.Context, handler module.Handler, r
 	})
 }
 
-func (c *Component) handleError(ctx context.Context, handler module.Handler, req Request, errMsg string) module.Result {
+func (c *Component) handleError(ctx context.Context, handler module.Handler, req Request, err error) module.Result {
 	c.settingsLock.RLock()
 	enableErrorPort := c.settings.EnableErrorPort
 	c.settingsLock.RUnlock()
@@ -136,10 +137,10 @@ func (c *Component) handleError(ctx context.Context, handler module.Handler, req
 	if enableErrorPort {
 		return handler(ctx, ErrorPort, Error{
 			Context: req.Context,
-			Error:   errMsg,
+			Error:   err.Error(),
 		})
 	}
-	return module.Fail(errors.New(errMsg))
+	return module.Fail(err)
 }
 
 func (c *Component) Ports() []module.Port {

@@ -12,6 +12,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/tiny-systems/distribution-module/internal/regerr"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
 	"github.com/tiny-systems/module/registry"
@@ -102,7 +103,7 @@ func (c *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 func (c *Component) handleRequest(ctx context.Context, handler module.Handler, req Request) module.Result {
 	if req.Source == "" || req.Target == "" {
-		return c.handleError(ctx, handler, req, "source and target are required")
+		return c.handleError(ctx, handler, req, errors.New("source and target are required"))
 	}
 
 	srcKeychain := buildKeychain(req.DockerConfigJSON)
@@ -116,16 +117,16 @@ func (c *Component) handleRequest(ctx context.Context, handler module.Handler, r
 
 	img, err := crane.Pull(req.Source, srcOpts...)
 	if err != nil {
-		return c.handleError(ctx, handler, req, fmt.Sprintf("pull failed: %v", err))
+		return c.handleError(ctx, handler, req, regerr.Classify(fmt.Errorf("pull failed: %w", err)))
 	}
 
 	if err := crane.Push(img, req.Target, dstOpts...); err != nil {
-		return c.handleError(ctx, handler, req, fmt.Sprintf("push failed: %v", err))
+		return c.handleError(ctx, handler, req, regerr.Classify(fmt.Errorf("push failed: %w", err)))
 	}
 
 	digest, err := crane.Digest(req.Target, dstOpts...)
 	if err != nil {
-		return c.handleError(ctx, handler, req, fmt.Sprintf("copy succeeded but failed to get digest: %v", err))
+		return c.handleError(ctx, handler, req, regerr.Classify(fmt.Errorf("copy succeeded but failed to get digest: %w", err)))
 	}
 
 	return handler(ctx, ResultPort, Result{
@@ -187,7 +188,7 @@ func buildKeychain(dockerConfigJSON string) authn.Keychain {
 	return kc
 }
 
-func (c *Component) handleError(ctx context.Context, handler module.Handler, req Request, errMsg string) module.Result {
+func (c *Component) handleError(ctx context.Context, handler module.Handler, req Request, err error) module.Result {
 	c.settingsLock.RLock()
 	enableErrorPort := c.settings.EnableErrorPort
 	c.settingsLock.RUnlock()
@@ -195,10 +196,10 @@ func (c *Component) handleError(ctx context.Context, handler module.Handler, req
 	if enableErrorPort {
 		return handler(ctx, ErrorPort, Error{
 			Context: req.Context,
-			Error:   errMsg,
+			Error:   err.Error(),
 		})
 	}
-	return module.Fail(errors.New(errMsg))
+	return module.Fail(err)
 }
 
 func (c *Component) Ports() []module.Port {
