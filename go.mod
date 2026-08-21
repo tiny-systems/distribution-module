@@ -7,7 +7,7 @@ require (
 	github.com/rs/zerolog v1.35.1
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
-	github.com/tiny-systems/module v0.13.117
+	github.com/tiny-systems/module v0.13.119
 )
 
 require (
